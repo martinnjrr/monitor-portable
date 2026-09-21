@@ -5,21 +5,23 @@ import threading
 
 app = Flask(__name__)
 
+
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
 
-TOKEN_MAIN = os.environ.get(
-    "TOKEN_MAIN",
-    ""
-)
+TOKEN_MAIN = os.environ.get("TOKEN_MAIN", "")
 
 NUM_SENSORES = 2
 
+# Límite provisional de alerta
 LIMITE_ALERTA = 150
 
+# 45 minutos
 INTERVALO_PROMEDIO = 45 * 60
 
+# Si el servidor no recibe datos durante 15 segundos,
+# el sistema se mostrará como desconectado.
 TIMEOUT_MAIN = 15
 
 lock = threading.Lock()
@@ -30,7 +32,7 @@ ultima_conexion_main = 0
 
 
 # ============================================================
-# DATOS
+# DATOS DE LOS SENSORES
 # ============================================================
 
 sensores = [
@@ -40,7 +42,7 @@ sensores = [
         "valor": 0,
         "suma": 0,
         "muestras": 0,
-        "promedio": 0,
+        "promedio": 0.0,
         "alerta": False,
         "conectado": False
     },
@@ -50,17 +52,22 @@ sensores = [
         "valor": 0,
         "suma": 0,
         "muestras": 0,
-        "promedio": 0,
+        "promedio": 0.0,
         "alerta": False,
         "conectado": False
     }
 ]
 
+
+# ============================================================
+# HISTORIAL
+# ============================================================
+
 historial = []
 
 
 # ============================================================
-# NO CACHE
+# EVITAR CACHE
 # ============================================================
 
 @app.after_request
@@ -77,7 +84,7 @@ def no_cache(response):
 
 
 # ============================================================
-# FINALIZAR PROMEDIO
+# COMPROBAR Y CERRAR PERÍODO DE 45 MINUTOS
 # ============================================================
 
 def comprobar_periodo():
@@ -86,10 +93,7 @@ def comprobar_periodo():
 
     ahora = time.time()
 
-    if (
-        ahora - inicio_periodo
-        < INTERVALO_PROMEDIO
-    ):
+    if ahora - inicio_periodo < INTERVALO_PROMEDIO:
         return
 
     for sensor in sensores:
@@ -105,73 +109,76 @@ def comprobar_periodo():
             historial.insert(
                 0,
                 {
-                    "id":
-                        sensor["id"],
-
-                    "nombre":
-                        sensor["nombre"],
-
-                    "promedio":
-                        round(
-                            promedio_final,
-                            1
-                        ),
-
-                    "alerta":
-                        promedio_final
-                        >= LIMITE_ALERTA,
-
-                    "periodo":
-                        "45 min"
+                    "id": sensor["id"],
+                    "nombre": sensor["nombre"],
+                    "promedio": round(promedio_final, 1),
+                    "alerta": promedio_final >= LIMITE_ALERTA,
+                    "periodo": "45 min",
+                    "timestamp": int(ahora)
                 }
             )
 
+        # Reiniciar acumuladores
         sensor["suma"] = 0
         sensor["muestras"] = 0
-        sensor["promedio"] = 0
+        sensor["promedio"] = 0.0
 
+    # Mantener máximo 100 registros
     if len(historial) > 100:
-
         del historial[100:]
 
-    inicio_periodo = agora = time.time()
+    inicio_periodo = time.time()
 
 
 # ============================================================
-# RECIBIR JAVI
+# RECIBIR DATOS DESDE EL ESP32 PRINCIPAL
+#
+# POST /api/main
+#
+# JSON esperado:
+#
+# {
+#   "sensores": [
+#       {
+#           "id": 1,
+#           "valor": 120,
+#           "alerta": false,
+#           "conectado": true
+#       },
+#       {
+#           "id": 2,
+#           "valor": 170,
+#           "alerta": true,
+#           "conectado": true
+#       }
+#   ]
+# }
 # ============================================================
 
-@app.route(
-    "/api/main",
-    methods=["POST"]
-)
+@app.route("/api/main", methods=["POST"])
 def recibir_main():
 
     global ultima_conexion_main
 
     # ========================================================
-    # SEGURIDAD
+    # COMPROBAR TOKEN
     # ========================================================
 
-    token = request.headers.get(
-        "X-Token",
-        ""
-    )
+    token = request.headers.get("X-Token", "")
 
-    if (
-        not TOKEN_MAIN
-        or
-        token != TOKEN_MAIN
-    ):
+    if not TOKEN_MAIN or token != TOKEN_MAIN:
 
         return jsonify({
             "ok": False,
             "error": "No autorizado"
         }), 401
 
-    datos = request.get_json(
-        silent=True
-    )
+
+    # ========================================================
+    # LEER JSON
+    # ========================================================
+
+    datos = request.get_json(silent=True)
 
     if not isinstance(datos, dict):
 
@@ -180,19 +187,20 @@ def recibir_main():
             "error": "JSON invalido"
         }), 400
 
-    recibidos = datos.get(
-        "sensores"
-    )
 
-    if not isinstance(
-        recibidos,
-        list
-    ):
+    recibidos = datos.get("sensores")
+
+    if not isinstance(recibidos, list):
 
         return jsonify({
             "ok": False,
-            "error": "Sensores invalidos"
+            "error": "Lista de sensores invalida"
         }), 400
+
+
+    # ========================================================
+    # ACTUALIZAR DATOS
+    # ========================================================
 
     with lock:
 
@@ -202,36 +210,31 @@ def recibir_main():
 
         for recibido in recibidos:
 
+            if not isinstance(recibido, dict):
+                continue
+
             try:
 
                 sensor_id = int(
-                    recibido.get(
-                        "id",
-                        0
-                    )
+                    recibido.get("id", 0)
                 )
 
                 valor = int(
-                    recibido.get(
-                        "valor",
-                        0
-                    )
+                    recibido.get("valor", 0)
                 )
 
-            except (
-                TypeError,
-                ValueError
-            ):
-
+            except (TypeError, ValueError):
                 continue
+
 
             if sensor_id not in (1, 2):
-
                 continue
+
 
             indice = sensor_id - 1
 
             sensor = sensores[indice]
+
 
             conectado = bool(
                 recibido.get(
@@ -240,25 +243,31 @@ def recibir_main():
                 )
             )
 
+
             sensor["conectado"] = conectado
+
 
             if conectado:
 
                 sensor["valor"] = valor
 
+                # El servidor calcula el estado.
                 sensor["alerta"] = (
                     valor >= LIMITE_ALERTA
                 )
 
+                # Acumular lectura
                 sensor["suma"] += valor
 
                 sensor["muestras"] += 1
 
+                # Promedio acumulado actual
                 sensor["promedio"] = (
                     sensor["suma"]
                     /
                     sensor["muestras"]
                 )
+
 
     return jsonify({
         "ok": True
@@ -266,7 +275,7 @@ def recibir_main():
 
 
 # ============================================================
-# API DATOS WEB
+# API DE DATOS EN VIVO
 # ============================================================
 
 @app.route("/api/datos")
@@ -281,71 +290,55 @@ def api_datos():
         main_conectado = (
             ultima_conexion_main > 0
             and
-            agora - ultima_conexion_main
-            <= TIMEOUT_MAIN
+            ahora - ultima_conexion_main <= TIMEOUT_MAIN
         )
+
 
         restante = max(
             0,
             INTERVALO_PROMEDIO
             -
             int(
-                agora
-                -
-                inicio_periodo
+                ahora - inicio_periodo
             )
         )
 
-        respuesta = []
+
+        respuesta_sensores = []
+
 
         for sensor in sensores:
 
-            respuesta.append({
+            conectado_real = (
+                main_conectado
+                and
+                sensor["conectado"]
+            )
 
-                "id":
-                    sensor["id"],
 
-                "nombre":
-                    sensor["nombre"],
-
-                "valor":
-                    sensor["valor"],
-
-                "promedio":
-                    round(
-                        sensor["promedio"],
-                        1
-                    ),
-
-                "alerta":
-                    sensor["alerta"],
-
-                "conectado":
-                    (
-                        main_conectado
-                        and
-                        sensor["conectado"]
-                    )
+            respuesta_sensores.append({
+                "id": sensor["id"],
+                "nombre": sensor["nombre"],
+                "valor": sensor["valor"],
+                "promedio": round(
+                    sensor["promedio"],
+                    1
+                ),
+                "alerta": sensor["alerta"],
+                "conectado": conectado_real
             })
 
+
     return jsonify({
-
-        "conectado":
-            main_conectado,
-
-        "tiempo_restante":
-            restante,
-
-        "intervalo_promedio":
-            INTERVALO_PROMEDIO,
-
-        "sensores":
-            respuesta
+        "conectado": main_conectado,
+        "tiempo_restante": restante,
+        "intervalo_promedio": INTERVALO_PROMEDIO,
+        "sensores": respuesta_sensores
     })
 
 
 # ============================================================
-# HISTORIAL
+# API DE PROMEDIOS
 # ============================================================
 
 @app.route("/api/promedios")
@@ -361,35 +354,33 @@ def api_promedios():
 
 
 # ============================================================
-# STATUS
+# API DE ESTADO
 # ============================================================
 
 @app.route("/api/status")
-def status():
+def api_status():
 
     ahora = time.time()
 
-    conectado = (
-        ultima_conexion_main > 0
-        and
-        agora - ultima_conexion_main
-        <= TIMEOUT_MAIN
-    )
+    with lock:
+
+        conectado = (
+            ultima_conexion_main > 0
+            and
+            ahora - ultima_conexion_main <= TIMEOUT_MAIN
+        )
+
 
     return jsonify({
-
         "servidor": True,
-
-        "conectado":
-            conectado,
-
-        "sensores":
-            NUM_SENSORES
+        "conectado": conectado,
+        "sensores": NUM_SENSORES,
+        "limite_alerta": LIMITE_ALERTA
     })
 
 
 # ============================================================
-# HTML
+# INTERFAZ WEB
 # ============================================================
 
 HTML = r"""
@@ -408,14 +399,21 @@ HTML = r"""
 
 <title>Monitoreo portable de CO₂</title>
 
+
 <style>
 
-*{
-    box-sizing:border-box;
+/* ==========================================================
+   GENERAL
+   ========================================================== */
+
+* {
+    box-sizing: border-box;
 }
 
-body{
-    margin:0;
+
+body {
+
+    margin: 0;
 
     font-family:
         Inter,
@@ -425,9 +423,9 @@ body{
         "Segoe UI",
         sans-serif;
 
-    background:#f5f6f8;
+    background: #f5f6f8;
 
-    color:#18181b;
+    color: #18181b;
 }
 
 
@@ -435,77 +433,79 @@ body{
    SIDEBAR
    ========================================================== */
 
-.sidebar{
+.sidebar {
 
-    position:fixed;
+    position: fixed;
 
-    top:18px;
-    left:18px;
+    top: 18px;
+    left: 18px;
 
-    width:68px;
+    width: 68px;
 
-    padding:9px;
+    padding: 9px;
 
-    display:flex;
+    display: flex;
 
-    flex-direction:column;
+    flex-direction: column;
 
-    gap:8px;
+    gap: 8px;
 
-    background:white;
+    background: #ffffff;
 
-    border:1px solid #e4e4e7;
+    border: 1px solid #e4e4e7;
 
-    border-radius:20px;
+    border-radius: 20px;
 
     box-shadow:
         0 8px 30px
-        rgba(0,0,0,.06);
+        rgba(0, 0, 0, .06);
 
-    z-index:10;
+    z-index: 10;
 }
 
 
-.nav-button{
+.nav-button {
 
-    width:48px;
-    height:48px;
+    width: 48px;
+    height: 48px;
 
-    border:none;
+    border: none;
 
-    border-radius:14px;
+    border-radius: 14px;
 
-    background:transparent;
+    background: transparent;
 
-    font-size:20px;
+    font-size: 20px;
 
-    cursor:pointer;
+    cursor: pointer;
 
-    transition:.18s;
+    transition:
+        background .18s ease,
+        transform .18s ease;
 }
 
 
-.nav-button:hover{
+.nav-button:hover {
 
-    background:#f4f4f5;
+    background: #f4f4f5;
 
-    transform:translateY(-1px);
+    transform: translateY(-1px);
 }
 
 
-.nav-button.active{
+.nav-button.active {
 
-    background:#000080;
+    background: #000080;
 
-    color:white;
+    color: #ffffff;
 }
 
 
 /* ==========================================================
-   CONTAINER
+   CONTENEDOR
    ========================================================== */
 
-.container{
+.container {
 
     width:
         min(
@@ -513,9 +513,9 @@ body{
             calc(100% - 130px)
         );
 
-    margin:0 auto;
+    margin: 0 auto;
 
-    padding:50px 0 80px;
+    padding: 50px 0 80px;
 }
 
 
@@ -523,31 +523,31 @@ body{
    HEADER
    ========================================================== */
 
-.header{
+.header {
 
-    margin-bottom:34px;
+    margin-bottom: 34px;
 }
 
 
-.eyebrow{
+.eyebrow {
 
-    color:#000080;
+    color: #000080;
 
-    font-size:12px;
+    font-size: 12px;
 
-    font-weight:800;
+    font-weight: 800;
 
-    letter-spacing:1.5px;
+    letter-spacing: 1.5px;
 
-    text-transform:uppercase;
+    text-transform: uppercase;
 
-    margin-bottom:8px;
+    margin-bottom: 8px;
 }
 
 
-.header h1{
+.header h1 {
 
-    margin:0;
+    margin: 0;
 
     font-size:
         clamp(
@@ -556,17 +556,17 @@ body{
             44px
         );
 
-    letter-spacing:-1.7px;
+    letter-spacing: -1.7px;
 }
 
 
-.subtitle{
+.subtitle {
 
-    margin-top:8px;
+    margin-top: 8px;
 
-    color:#71717a;
+    color: #71717a;
 
-    font-size:15px;
+    font-size: 15px;
 }
 
 
@@ -574,52 +574,54 @@ body{
    ESTADO GENERAL
    ========================================================== */
 
-.status-row{
+.status-row {
 
-    display:flex;
+    display: flex;
 
-    margin-top:22px;
+    margin-top: 22px;
 }
 
 
-.status-pill{
+.status-pill {
 
-    display:flex;
+    display: flex;
 
-    align-items:center;
+    align-items: center;
 
-    gap:8px;
+    gap: 8px;
 
-    padding:9px 13px;
+    padding: 9px 13px;
 
-    background:white;
+    background: #ffffff;
 
-    border:1px solid #e4e4e7;
+    border: 1px solid #e4e4e7;
 
-    border-radius:999px;
+    border-radius: 999px;
 
-    font-size:13px;
+    font-size: 13px;
 }
 
 
-.dot{
+.dot {
 
-    width:8px;
-    height:8px;
+    width: 8px;
+    height: 8px;
 
-    border-radius:50%;
+    border-radius: 50%;
 
-    background:#a1a1aa;
+    background: #a1a1aa;
 }
 
 
-.dot.ok{
-    background:#22c55e;
+.dot.ok {
+
+    background: #22c55e;
 }
 
 
-.dot.off{
-    background:#ef4444;
+.dot.off {
+
+    background: #ef4444;
 }
 
 
@@ -627,77 +629,81 @@ body{
    GRID
    ========================================================== */
 
-.grid{
+.grid {
 
-    display:grid;
+    display: grid;
 
     grid-template-columns:
         repeat(
             2,
-            minmax(0,1fr)
+            minmax(0, 1fr)
         );
 
-    gap:20px;
+    gap: 20px;
 }
 
 
 /* ==========================================================
-   CARDS
+   TARJETAS
    ========================================================== */
 
-.card{
+.card {
 
-    min-height:370px;
+    min-height: 370px;
 
-    padding:25px;
+    padding: 25px;
 
-    background:white;
+    background: #ffffff;
 
-    border:1px solid #e4e4e7;
+    border: 1px solid #e4e4e7;
 
-    border-radius:26px;
+    border-radius: 26px;
 
     box-shadow:
         0 8px 35px
-        rgba(0,0,0,.04);
+        rgba(0, 0, 0, .04);
 
-    transition:.22s;
+    transition:
+        transform .22s ease,
+        box-shadow .22s ease;
 }
 
 
-.card:hover{
+.card:hover {
 
-    transform:translateY(-3px);
+    transform: translateY(-3px);
 
     box-shadow:
         0 14px 45px
-        rgba(0,0,0,.07);
+        rgba(0, 0, 0, .07);
 }
 
 
-.card-top{
+.card-top {
 
-    display:flex;
+    display: flex;
 
-    justify-content:space-between;
+    justify-content: space-between;
 
-    align-items:center;
+    align-items: center;
+
+    gap: 15px;
 }
 
 
-.sensor-name{
+.sensor-name {
 
-    font-size:15px;
+    font-size: 15px;
 
-    font-weight:750;
+    font-weight: 750;
 }
 
 
-.connection{
+.connection {
 
-    color:#71717a;
+    color: #71717a;
 
-    font-size:12px;
+    font-size: 12px;
 }
 
 
@@ -705,9 +711,9 @@ body{
    VALOR
    ========================================================== */
 
-.value{
+.value {
 
-    margin-top:25px;
+    margin-top: 25px;
 
     font-size:
         clamp(
@@ -716,21 +722,21 @@ body{
             82px
         );
 
-    font-weight:750;
+    font-weight: 750;
 
-    letter-spacing:-4px;
+    letter-spacing: -4px;
 
-    line-height:1;
+    line-height: 1;
 }
 
 
-.value-label{
+.value-label {
 
-    margin-top:8px;
+    margin-top: 8px;
 
-    color:#a1a1aa;
+    color: #a1a1aa;
 
-    font-size:12px;
+    font-size: 12px;
 }
 
 
@@ -738,83 +744,84 @@ body{
    ESTADOS
    ========================================================== */
 
-.state{
+.state {
 
-    display:inline-block;
+    display: inline-block;
 
-    margin-top:20px;
+    margin-top: 20px;
 
-    padding:7px 11px;
+    padding: 7px 11px;
 
-    border-radius:999px;
+    border-radius: 999px;
 
-    font-size:11px;
+    font-size: 11px;
 
-    font-weight:800;
+    font-weight: 800;
 
-    letter-spacing:.7px;
+    letter-spacing: .7px;
 }
 
 
-.state.normal{
+.state.normal {
 
-    color:#166534;
+    color: #166534;
 
-    background:#dcfce7;
+    background: #dcfce7;
 }
 
 
-.state.alert{
+.state.alert {
 
-    color:#991b1b;
+    color: #991b1b;
 
-    background:#fee2e2;
+    background: #fee2e2;
 }
 
 
-.state.offline{
+.state.offline {
 
-    color:#71717a;
+    color: #71717a;
 
-    background:#f4f4f5;
+    background: #f4f4f5;
 }
 
 
 /* ==========================================================
-   DETAILS
+   DETALLES
    ========================================================== */
 
-.details{
+.details {
 
-    display:grid;
+    display: grid;
 
-    grid-template-columns:1fr 1fr;
+    grid-template-columns:
+        1fr 1fr;
 
-    gap:18px;
+    gap: 18px;
 
-    margin-top:27px;
+    margin-top: 27px;
 
-    padding-top:20px;
+    padding-top: 20px;
 
-    border-top:1px solid #f0f0f0;
+    border-top: 1px solid #f0f0f0;
 }
 
 
-.detail-title{
+.detail-title {
 
-    margin-bottom:6px;
+    margin-bottom: 6px;
 
-    color:#a1a1aa;
+    color: #a1a1aa;
 
-    font-size:11px;
+    font-size: 11px;
 }
 
 
-.detail-value{
+.detail-value {
 
-    font-size:15px;
+    font-size: 15px;
 
-    font-weight:700;
+    font-weight: 700;
 }
 
 
@@ -822,29 +829,31 @@ body{
    PROGRESO
    ========================================================== */
 
-.progress{
+.progress {
 
-    height:6px;
+    height: 6px;
 
-    margin-top:20px;
+    margin-top: 20px;
 
-    overflow:hidden;
+    overflow: hidden;
 
-    background:#f1f1f1;
+    background: #f1f1f1;
 
-    border-radius:100px;
+    border-radius: 100px;
 }
 
 
-.progress-bar{
+.progress-bar {
 
-    height:100%;
+    width: 0%;
 
-    background:#000080;
+    height: 100%;
 
-    border-radius:100px;
+    background: #000080;
 
-    transition:width .7s ease;
+    border-radius: 100px;
+
+    transition: width .7s ease;
 }
 
 
@@ -852,122 +861,122 @@ body{
    HISTORIAL
    ========================================================== */
 
-.history{
+.history {
 
-    display:none;
+    display: none;
 }
 
 
-.history.active{
+.history.active {
 
-    display:block;
+    display: block;
 }
 
 
-.live.hidden{
+.live.hidden {
 
-    display:none;
+    display: none;
 }
 
 
-.history-card{
+.history-card {
 
-    overflow:hidden;
+    overflow: hidden;
 
-    background:white;
+    background: #ffffff;
 
-    border:1px solid #e4e4e7;
+    border: 1px solid #e4e4e7;
 
-    border-radius:26px;
+    border-radius: 26px;
 }
 
 
-.history-header{
+.history-header {
 
-    padding:24px;
+    padding: 24px;
 
-    border-bottom:1px solid #eee;
+    border-bottom: 1px solid #eeeeee;
 }
 
 
-.history-header h2{
+.history-header h2 {
 
-    margin:0;
+    margin: 0;
 
-    font-size:21px;
+    font-size: 21px;
 }
 
 
-.history-header p{
+.history-header p {
 
-    margin:7px 0 0;
+    margin: 7px 0 0;
 
-    color:#71717a;
+    color: #71717a;
 
-    font-size:13px;
+    font-size: 13px;
 }
 
 
-table{
+table {
 
-    width:100%;
+    width: 100%;
 
-    border-collapse:collapse;
+    border-collapse: collapse;
 }
 
 
 th,
-td{
+td {
 
-    padding:17px 22px;
+    padding: 17px 22px;
 
-    text-align:left;
+    text-align: left;
 
-    border-bottom:1px solid #f1f1f1;
+    border-bottom: 1px solid #f1f1f1;
 
-    font-size:13px;
+    font-size: 13px;
 }
 
 
-th{
+th {
 
-    color:#71717a;
+    color: #71717a;
 
-    font-size:11px;
+    font-size: 11px;
 
-    text-transform:uppercase;
+    text-transform: uppercase;
 }
 
 
 /* ==========================================================
-   MOBILE
+   RESPONSIVE
    ========================================================== */
 
-@media(max-width:750px){
+@media(max-width: 750px) {
 
-    .sidebar{
+    .sidebar {
 
-        position:static;
+        position: static;
 
-        width:max-content;
+        width: max-content;
 
-        margin:15px auto 0;
+        margin: 15px auto 0;
 
-        flex-direction:row;
+        flex-direction: row;
     }
 
 
-    .container{
+    .container {
 
-        width:calc(100% - 28px);
+        width: calc(100% - 28px);
 
-        padding-top:30px;
+        padding-top: 30px;
     }
 
 
-    .grid{
+    .grid {
 
-        grid-template-columns:1fr;
+        grid-template-columns: 1fr;
     }
 }
 
@@ -978,6 +987,10 @@ th{
 
 <body>
 
+
+<!-- ========================================================
+     NAVEGACIÓN
+     ======================================================== -->
 
 <div class="sidebar">
 
@@ -1006,15 +1019,21 @@ th{
 <div class="container">
 
 
+<!-- ========================================================
+     HEADER
+     ======================================================== -->
+
 <header class="header">
 
     <div class="eyebrow">
         MONITOREO PORTABLE DE CO₂
     </div>
 
+
     <h1>
         Monitoreo portable de CO₂
     </h1>
+
 
     <div class="subtitle">
         Monitoreo en tiempo real · 2 muestras
@@ -1031,6 +1050,7 @@ th{
             >
             </span>
 
+
             <span id="statusText">
                 Comprobando...
             </span>
@@ -1041,6 +1061,10 @@ th{
 
 </header>
 
+
+<!-- ========================================================
+     EN VIVO
+     ======================================================== -->
 
 <section
     id="liveView"
@@ -1056,12 +1080,17 @@ th{
 </section>
 
 
+<!-- ========================================================
+     HISTORIAL
+     ======================================================== -->
+
 <section
     id="historyView"
     class="history"
 >
 
     <div class="history-card">
+
 
         <div class="history-header">
 
@@ -1084,13 +1113,21 @@ th{
 
                     <tr>
 
-                        <th>Muestra</th>
+                        <th>
+                            Muestra
+                        </th>
 
-                        <th>Promedio</th>
+                        <th>
+                            Promedio
+                        </th>
 
-                        <th>Estado</th>
+                        <th>
+                            Estado
+                        </th>
 
-                        <th>Período</th>
+                        <th>
+                            Período
+                        </th>
 
                     </tr>
 
@@ -1114,17 +1151,26 @@ th{
 
 <script>
 
-function crearTarjetas(){
+/* ==========================================================
+   CREAR TARJETAS
+   ========================================================== */
+
+function crearTarjetas() {
 
     const grid =
         document.getElementById(
             "sensorGrid"
         );
 
+
     grid.innerHTML = "";
 
 
-    for(let id = 1; id <= 2; id++){
+    for (
+        let id = 1;
+        id <= 2;
+        id++
+    ) {
 
         grid.innerHTML += `
 
@@ -1138,6 +1184,7 @@ function crearTarjetas(){
                 >
                     Muestra ${id}
                 </div>
+
 
                 <div
                     class="connection"
@@ -1217,12 +1264,17 @@ function crearTarjetas(){
             </div>
 
         </article>
+
         `;
     }
 }
 
 
-function formatoTiempo(segundos){
+/* ==========================================================
+   FORMATO DE TIEMPO
+   ========================================================== */
+
+function formatoTiempo(segundos) {
 
     segundos =
         Math.max(
@@ -1230,37 +1282,48 @@ function formatoTiempo(segundos){
             Math.floor(segundos)
         );
 
+
     const minutos =
         Math.floor(
             segundos / 60
         );
 
+
     const segundosRestantes =
         segundos % 60;
 
+
     return (
-        String(minutos).padStart(2,"0")
+        String(minutos)
+            .padStart(2, "0")
         +
         ":"
         +
-        String(segundosRestantes).padStart(2,"0")
+        String(segundosRestantes)
+            .padStart(2, "0")
     );
 }
 
 
-async function actualizar(){
+/* ==========================================================
+   ACTUALIZAR PÁGINA
+   ========================================================== */
+
+async function actualizar() {
 
     const statusDot =
         document.getElementById(
             "statusDot"
         );
 
+
     const statusText =
         document.getElementById(
             "statusText"
         );
 
-    try{
+
+    try {
 
         const respuesta =
             await fetch(
@@ -1268,22 +1331,28 @@ async function actualizar(){
                 +
                 Date.now(),
                 {
-                    cache:"no-store"
+                    cache: "no-store"
                 }
             );
 
-        if(!respuesta.ok){
+
+        if (!respuesta.ok) {
 
             throw new Error(
                 "Servidor no disponible"
             );
         }
 
+
         const datos =
             await respuesta.json();
 
 
-        if(datos.conectado){
+        // ===================================================
+        // ESTADO GENERAL
+        // ===================================================
+
+        if (datos.conectado) {
 
             statusDot.className =
                 "dot ok";
@@ -1291,7 +1360,7 @@ async function actualizar(){
             statusText.textContent =
                 "Conectado";
 
-        }else{
+        } else {
 
             statusDot.className =
                 "dot off";
@@ -1301,22 +1370,30 @@ async function actualizar(){
         }
 
 
+        // ===================================================
+        // PROGRESO DEL PROMEDIO
+        // ===================================================
+
         const restante =
             Number(
                 datos.tiempo_restante
             );
+
 
         const intervalo =
             Number(
                 datos.intervalo_promedio
             );
 
+
         const porcentaje =
             intervalo > 0
             ?
             (
                 (
-                    intervalo - restante
+                    intervalo
+                    -
+                    restante
                 )
                 /
                 intervalo
@@ -1327,10 +1404,14 @@ async function actualizar(){
             0;
 
 
-        for(
+        // ===================================================
+        // ACTUALIZAR SENSORES
+        // ===================================================
+
+        for (
             const sensor
             of datos.sensores
-        ){
+        ) {
 
             const id =
                 sensor.id;
@@ -1398,7 +1479,7 @@ async function actualizar(){
                 );
 
 
-            if(!sensor.conectado){
+            if (!sensor.conectado) {
 
                 conexion.textContent =
                     "Sin conexión";
@@ -1411,7 +1492,7 @@ async function actualizar(){
 
             }
 
-            else if(sensor.alerta){
+            else if (sensor.alerta) {
 
                 conexion.textContent =
                     "Conectado";
@@ -1424,7 +1505,7 @@ async function actualizar(){
 
             }
 
-            else{
+            else {
 
                 conexion.textContent =
                     "Conectado";
@@ -1439,20 +1520,68 @@ async function actualizar(){
 
     }
 
-    catch(error){
+    catch (error) {
 
         statusDot.className =
             "dot off";
 
         statusText.textContent =
             "Desconectado";
+
+
+        for (
+            let id = 1;
+            id <= 2;
+            id++
+        ) {
+
+            document.getElementById(
+                `connection-${id}`
+            ).textContent =
+                "Sin conexión";
+
+
+            document.getElementById(
+                `value-${id}`
+            ).textContent =
+                "--";
+
+
+            document.getElementById(
+                `average-${id}`
+            ).textContent =
+                "--";
+
+
+            const estado =
+                document.getElementById(
+                    `state-${id}`
+                );
+
+
+            estado.className =
+                "state offline";
+
+            estado.textContent =
+                "DESCONECTADO";
+        }
+
+
+        console.error(
+            "Error:",
+            error
+        );
     }
 }
 
 
-async function cargarHistorial(){
+/* ==========================================================
+   CARGAR HISTORIAL
+   ========================================================== */
 
-    try{
+async function cargarHistorial() {
+
+    try {
 
         const respuesta =
             await fetch(
@@ -1460,9 +1589,17 @@ async function cargarHistorial(){
                 +
                 Date.now(),
                 {
-                    cache:"no-store"
+                    cache: "no-store"
                 }
             );
+
+
+        if (!respuesta.ok) {
+
+            throw new Error(
+                "No se pudo cargar el historial"
+            );
+        }
 
 
         const datos =
@@ -1478,11 +1615,11 @@ async function cargarHistorial(){
         body.innerHTML = "";
 
 
-        if(
+        if (
             !datos.historial
             ||
             datos.historial.length === 0
-        ){
+        ) {
 
             body.innerHTML = `
 
@@ -1500,10 +1637,10 @@ async function cargarHistorial(){
         }
 
 
-        for(
+        for (
             const registro
             of datos.historial
-        ){
+        ) {
 
             body.innerHTML += `
 
@@ -1513,11 +1650,13 @@ async function cargarHistorial(){
                     ${registro.nombre}
                 </td>
 
+
                 <td>
                     ${Number(
                         registro.promedio
                     ).toFixed(1)}
                 </td>
+
 
                 <td>
                     ${
@@ -1529,24 +1668,33 @@ async function cargarHistorial(){
                     }
                 </td>
 
+
                 <td>
                     ${registro.periodo}
                 </td>
 
             </tr>
+
             `;
         }
 
     }
 
-    catch(error){
+    catch (error) {
 
-        console.error(error);
+        console.error(
+            "Error cargando historial:",
+            error
+        );
     }
 }
 
 
-function mostrarLive(){
+/* ==========================================================
+   NAVEGACIÓN
+   ========================================================== */
+
+function mostrarLive() {
 
     document.getElementById(
         "liveView"
@@ -1554,17 +1702,20 @@ function mostrarLive(){
         "hidden"
     );
 
+
     document.getElementById(
         "historyView"
     ).classList.remove(
         "active"
     );
 
+
     document.getElementById(
         "btnLive"
     ).classList.add(
         "active"
     );
+
 
     document.getElementById(
         "btnHistory"
@@ -1574,7 +1725,7 @@ function mostrarLive(){
 }
 
 
-function mostrarHistorial(){
+function mostrarHistorial() {
 
     document.getElementById(
         "liveView"
@@ -1582,11 +1733,13 @@ function mostrarHistorial(){
         "hidden"
     );
 
+
     document.getElementById(
         "historyView"
     ).classList.add(
         "active"
     );
+
 
     document.getElementById(
         "btnLive"
@@ -1594,26 +1747,35 @@ function mostrarHistorial(){
         "active"
     );
 
+
     document.getElementById(
         "btnHistory"
     ).classList.add(
         "active"
     );
+
 
     cargarHistorial();
 }
 
 
+/* ==========================================================
+   INICIO
+   ========================================================== */
+
 crearTarjetas();
 
 actualizar();
 
+
+// Actualizar la pantalla cada 2 segundos
 setInterval(
     actualizar,
     2000
 );
 
 </script>
+
 
 </body>
 
@@ -1622,7 +1784,7 @@ setInterval(
 
 
 # ============================================================
-# WEB
+# PÁGINA PRINCIPAL
 # ============================================================
 
 @app.route("/")
@@ -1638,6 +1800,14 @@ def inicio():
 # ============================================================
 
 if __name__ == "__main__":
+
+    print()
+    print("======================================")
+    print(" MONITOREO PORTABLE DE CO2")
+    print("======================================")
+    print(" http://localhost:5000")
+    print("======================================")
+    print()
 
     app.run(
         host="0.0.0.0",
